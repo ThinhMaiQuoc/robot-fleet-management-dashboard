@@ -1,93 +1,410 @@
 const { App } = require('uWebSockets.js');
+const mongoose = require('mongoose');
 const qs = require('node:querystring');
-const { connectDB } = require('./database/index.js');
+const {
+  connectDB,
+  models: {
+    RobotTelemetry,
+    RobotLatestState,
+  },
+} = require('./database/index.js');
 
-const PORT = process.env.PORT || 8080;
+const PORT = Number(process.env.PORT) || 8080;
+const DASHBOARD_TOPIC = 'dashboard:robot-updates';
+
+const HTTP_STATUS = {
+  200: '200 OK',
+  204: '204 No Content',
+  400: '400 Bad Request',
+  404: '404 Not Found',
+  500: '500 Internal Server Error',
+};
+
+function writeCorsHeaders(res) {
+  return res
+    .writeHeader('Access-Control-Allow-Origin', '*')
+    .writeHeader('Access-Control-Allow-Methods', 'GET,OPTIONS')
+    .writeHeader('Access-Control-Allow-Headers', 'Content-Type');
+}
+
+function sendJson(res, statusCode, payload) {
+  const body = payload === undefined ? '' : JSON.stringify(payload);
+
+  res.cork(() => {
+    res.writeStatus(HTTP_STATUS[statusCode] || HTTP_STATUS[500]);
+    writeCorsHeaders(res).writeHeader('Content-Type', 'application/json');
+    res.end(body);
+  });
+}
+
+function sendError(res, statusCode, message, details) {
+  sendJson(res, statusCode, {
+    error: message,
+    ...(details ? { details } : {}),
+  });
+}
+
+function sendWebSocketMessage(ws, payload) {
+  try {
+    ws.send(JSON.stringify(payload));
+  } catch (error) {
+    console.error('Failed to send WebSocket message:', error.message);
+  }
+}
+
+function getSocketRobotId(ws) {
+  const userData = typeof ws.getUserData === 'function' ? ws.getUserData() : ws;
+  return typeof userData.robotId === 'string' ? userData.robotId : '';
+}
+
+function parseRobotMessage(message) {
+  const rawMessage = Buffer.from(message).toString('utf8');
+
+  if (!rawMessage.trim()) {
+    return { error: 'Message body is empty' };
+  }
+
+  try {
+    const parsed = JSON.parse(rawMessage);
+
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { error: 'Message must be a JSON object' };
+    }
+
+    return { data: parsed };
+  } catch (error) {
+    return { error: 'Message must be valid JSON' };
+  }
+}
+
+function validateNumber(data, field, errors, options = {}) {
+  const value = data[field];
+
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    errors.push(`${field} must be a finite number`);
+    return undefined;
+  }
+
+  if (options.min !== undefined && value < options.min) {
+    errors.push(`${field} must be greater than or equal to ${options.min}`);
+  }
+
+  if (options.max !== undefined && value > options.max) {
+    errors.push(`${field} must be less than or equal to ${options.max}`);
+  }
+
+  return value;
+}
+
+function validateTelemetry(data, fallbackRobotId = '') {
+  const errors = [];
+  const hasPayloadRobotId = Object.prototype.hasOwnProperty.call(data, 'robotId');
+  let robotId = '';
+
+  if (hasPayloadRobotId) {
+    if (typeof data.robotId !== 'string' || data.robotId.trim() === '') {
+      errors.push('robotId must be a non-empty string');
+    } else {
+      robotId = data.robotId.trim();
+    }
+  } else if (typeof fallbackRobotId === 'string' && fallbackRobotId.trim() !== '') {
+    robotId = fallbackRobotId.trim();
+  } else {
+    errors.push('robotId must be a non-empty string');
+  }
+
+  const batteryPercentage = validateNumber(data, 'batteryPercentage', errors, {
+    min: 0,
+    max: 100,
+  });
+  const wifiSignalStrength = validateNumber(data, 'wifiSignalStrength', errors, {
+    min: -100,
+    max: 0,
+  });
+  const temperature = validateNumber(data, 'temperature', errors);
+  const memoryUsage = validateNumber(data, 'memoryUsage', errors, {
+    min: 0,
+    max: 100,
+  });
+
+  if (typeof data.isCharging !== 'boolean') {
+    errors.push('isCharging must be a boolean');
+  }
+
+  const timestamp = new Date(data.timestamp);
+  if (!data.timestamp || Number.isNaN(timestamp.getTime())) {
+    errors.push('timestamp must be a valid date');
+  }
+
+  if (errors.length > 0) {
+    return { errors };
+  }
+
+  return {
+    telemetry: {
+      robotId,
+      batteryPercentage,
+      wifiSignalStrength,
+      isCharging: data.isCharging,
+      temperature,
+      memoryUsage,
+      timestamp,
+    },
+  };
+}
+
+function serializeDate(value) {
+  return value instanceof Date ? value.toISOString() : new Date(value).toISOString();
+}
+
+function serializeRobotState(robot) {
+  return {
+    robotId: robot.robotId,
+    batteryPercentage: robot.batteryPercentage,
+    wifiSignalStrength: robot.wifiSignalStrength,
+    isCharging: robot.isCharging,
+    temperature: robot.temperature,
+    memoryUsage: robot.memoryUsage,
+    timestamp: serializeDate(robot.timestamp),
+    ...(robot.lastSeen ? { lastSeen: serializeDate(robot.lastSeen) } : {}),
+  };
+}
+
+async function persistTelemetry(telemetry) {
+  await RobotTelemetry.create(telemetry);
+
+  await RobotLatestState.findOneAndUpdate(
+    { robotId: telemetry.robotId },
+    {
+      $set: {
+        ...telemetry,
+        lastSeen: telemetry.timestamp,
+      },
+    },
+    {
+      upsert: true,
+      new: true,
+      setDefaultsOnInsert: true,
+    }
+  );
+}
+
+function handleAsyncRoute(res, handler) {
+  let aborted = false;
+
+  res.onAborted(() => {
+    aborted = true;
+  });
+
+  handler(() => aborted).catch((error) => {
+    console.error('HTTP request failed:', error);
+
+    if (!aborted) {
+      sendError(res, 500, 'Internal server error');
+    }
+  });
+}
 
 const app = App({
-  // Configure for production
   maxCompressedSize: 64 * 1024,
   maxBackpressure: 64 * 1024,
-}).ws('/robots', {
-  // Robot WebSocket connection handler
+});
+
+app.options('/*', (res) => {
+  res.cork(() => {
+    res.writeStatus(HTTP_STATUS[204]);
+    writeCorsHeaders(res);
+    res.end();
+  });
+});
+
+app.get('/health', (res) => {
+  sendJson(res, 200, {
+    status: 'ok',
+    database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString(),
+  });
+});
+
+app.get('/api/robots', (res) => {
+  handleAsyncRoute(res, async (isAborted) => {
+    const robots = await RobotLatestState.find({})
+      .sort({ robotId: 1 })
+      .lean();
+
+    if (!isAborted()) {
+      sendJson(res, 200, {
+        robots: robots.map(serializeRobotState),
+      });
+    }
+  });
+});
+
+app.get('/api/robots/:robotId/history', (res, req) => {
+  const robotId = req.getParameter(0);
+  const hoursQuery = req.getQuery('hours');
+  const hours = hoursQuery === undefined ? 6 : Number(hoursQuery);
+
+  handleAsyncRoute(res, async (isAborted) => {
+    if (!robotId || !robotId.trim()) {
+      if (!isAborted()) {
+        sendError(res, 400, 'robotId is required');
+      }
+      return;
+    }
+
+    if (!Number.isFinite(hours) || hours <= 0) {
+      if (!isAborted()) {
+        sendError(res, 400, 'hours must be a positive number');
+      }
+      return;
+    }
+
+    const since = new Date(Date.now() - hours * 60 * 60 * 1000);
+    const history = await RobotTelemetry.find({
+      robotId: robotId.trim(),
+      timestamp: { $gte: since },
+    })
+      .sort({ timestamp: 1 })
+      .lean();
+
+    if (!isAborted()) {
+      sendJson(res, 200, {
+        robotId: robotId.trim(),
+        hours,
+        data: history.map(serializeRobotState),
+      });
+    }
+  });
+});
+
+app.ws('/robots', {
+  maxPayloadLength: 16 * 1024,
+  maxBackpressure: 64 * 1024,
+
   message: async (ws, message) => {
+    const parsed = parseRobotMessage(message);
+
+    if (parsed.error) {
+      console.warn('Rejected robot telemetry:', parsed.error);
+      sendWebSocketMessage(ws, {
+        type: 'telemetry_error',
+        message: parsed.error,
+      });
+      return;
+    }
+
+    const validation = validateTelemetry(parsed.data, getSocketRobotId(ws));
+
+    if (validation.errors) {
+      console.warn('Rejected robot telemetry:', validation.errors.join('; '));
+      sendWebSocketMessage(ws, {
+        type: 'telemetry_error',
+        message: 'Invalid telemetry payload',
+        details: validation.errors,
+      });
+      return;
+    }
+
     try {
-      const data = JSON.parse(Buffer.from(message).toString());
-      console.log(`Received data from ${ws.robotId}:`, data);
+      await persistTelemetry(validation.telemetry);
+
+      const data = serializeRobotState(validation.telemetry);
+      app.publish(DASHBOARD_TOPIC, JSON.stringify({
+        type: 'robot_update',
+        robotId: data.robotId,
+        data,
+      }));
     } catch (error) {
-      console.error('Error processing robot message:', error);
+      console.error('Failed to store robot telemetry:', error);
+      sendWebSocketMessage(ws, {
+        type: 'telemetry_error',
+        message: 'Telemetry could not be stored',
+      });
     }
   },
 
   open: (ws) => {
-    console.log(`Robot ${ws.robotId} connected`);
+    console.log(`Robot ${getSocketRobotId(ws) || 'unknown'} connected`);
   },
 
   upgrade: (res, req, context) => {
-    const upgradeAborted = { aborted: false };
     const secWebSocketKey = req.getHeader('sec-websocket-key');
     const secWebSocketProtocol = req.getHeader('sec-websocket-protocol');
     const secWebSocketExtensions = req.getHeader('sec-websocket-extensions');
     const query = qs.parse(req.getQuery()) || {};
+    const queryRobotId = Array.isArray(query.robotId) ? query.robotId[0] : query.robotId;
 
-    setTimeout(async () => {
-      if (upgradeAborted.aborted) return;
-      res.cork(async () => {
-        res.upgrade(
-          {
-            robotId: query.robotId,
-          },
-          secWebSocketKey,
-          secWebSocketProtocol,
-          secWebSocketExtensions,
-          context
-        );
-      });
-    }, 300);
-
-    res.onAborted(() => {
-      upgradeAborted.aborted = true;
+    res.cork(() => {
+      res.upgrade(
+        {
+          robotId: typeof queryRobotId === 'string' ? queryRobotId.trim() : '',
+        },
+        secWebSocketKey,
+        secWebSocketProtocol,
+        secWebSocketExtensions,
+        context
+      );
     });
   },
 
   close: (ws) => {
-    console.log(`Robot ${ws.robotId} disconnected`);
-  }
-}).ws('/dashboard', {
+    console.log(`Robot ${getSocketRobotId(ws) || 'unknown'} disconnected`);
+  },
+});
+
+app.ws('/dashboard', {
+  maxPayloadLength: 16 * 1024,
+  maxBackpressure: 64 * 1024,
+
   message: (ws, message) => {
-    try {
-      const data = JSON.parse(Buffer.from(message).toString());
-      // TODO: Handle dashboard-specific messages
-      console.log('Dashboard message:', data);
-    } catch (error) {
-      console.error('Error processing dashboard message:', error);
+    const parsed = parseRobotMessage(message);
+
+    if (parsed.error) {
+      console.warn('Rejected dashboard message:', parsed.error);
+      return;
     }
+
+    console.log('Dashboard message:', parsed.data);
   },
 
   open: (ws) => {
+    ws.subscribe(DASHBOARD_TOPIC);
     console.log('Dashboard client connected');
   },
 
-  close: (ws, code, message) => {
+  close: () => {
     console.log('Dashboard client disconnected');
-  }
+  },
+});
 
-}).listen(PORT, (token) => {
-  if (token) {
-    console.log(`🚀 Robot Fleet Server listening on port ${PORT}`);
-  } else {
-    console.log('❌ Failed to listen on port', PORT);
+app.any('/*', (res) => {
+  sendError(res, 404, 'Not found');
+});
+
+connectDB()
+  .then(() => {
+    app.listen(PORT, (token) => {
+      if (token) {
+        console.log(`Robot Fleet Server listening on port ${PORT}`);
+      } else {
+        console.log('Failed to listen on port', PORT);
+        process.exit(1);
+      }
+    });
+  })
+  .catch(() => {
     process.exit(1);
-  }
-});
+  });
 
-// Initialize database connection
-connectDB().catch(console.error);
-
-// Graceful shutdown
-process.on('SIGINT', () => {
-  console.log('\n📛 Shutting down server...');
+async function shutdown() {
+  console.log('\nShutting down server...');
+  await mongoose.disconnect();
   process.exit(0);
-});
+}
+
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
 
 module.exports = app;

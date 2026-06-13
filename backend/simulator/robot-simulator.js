@@ -128,6 +128,7 @@ class RobotSimulator {
   sendData() {
     try {
       const data = {
+        robotId: this.robotId,
         batteryPercentage: this.state.batteryPercentage,
         wifiSignalStrength: this.state.wifiSignalStrength,
         isCharging: this.state.isCharging,
