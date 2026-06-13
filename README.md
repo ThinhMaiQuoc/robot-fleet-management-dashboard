@@ -395,6 +395,7 @@ Frontend:
 
 ```bash
 cd frontend
+npm run lint
 npm run build
 ```
 
@@ -428,4 +429,3 @@ Manual checks:
 - The frontend stores alert notification state in memory; refreshing the browser resets notification state.
 - Docker Compose does not include Redis because cluster IPC covers the required single-host worker fan-out.
 - The frontend Docker image bakes `API_BASE_URL` and `WEBSOCKET_URL` at build time through build args.
-- `next lint` may prompt for ESLint setup because the repo does not include an ESLint config.
