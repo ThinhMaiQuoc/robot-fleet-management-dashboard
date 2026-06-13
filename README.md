@@ -238,7 +238,7 @@ Validation:
 - `isCharging`: boolean.
 - `temperature`: number.
 - `memoryUsage`: number from `0` to `100`.
-- `timestamp`: valid date.
+- `timestamp`: valid date, and must not be in the future.
 
 Invalid telemetry is rejected without crashing the server. The robot socket receives:
 

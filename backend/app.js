@@ -11,6 +11,7 @@ const {
 
 const PORT = Number(process.env.PORT) || 8080;
 const DASHBOARD_TOPIC = 'dashboard:robot-updates';
+const FUTURE_LAST_SEEN_TOLERANCE_MS = 5_000;
 
 const HTTP_STATUS = {
   200: '200 OK',
@@ -134,6 +135,8 @@ function validateTelemetry(data, fallbackRobotId = '') {
   const timestamp = new Date(data.timestamp);
   if (!data.timestamp || Number.isNaN(timestamp.getTime())) {
     errors.push('timestamp must be a valid date');
+  } else if (timestamp.getTime() > Date.now()) {
+    errors.push('timestamp must not be in the future');
   }
 
   if (errors.length > 0) {
@@ -153,11 +156,23 @@ function validateTelemetry(data, fallbackRobotId = '') {
   };
 }
 
+function parseDateValue(value) {
+  if (!value) {
+    return null;
+  }
+
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
 function serializeDate(value) {
-  return value instanceof Date ? value.toISOString() : new Date(value).toISOString();
+  const date = parseDateValue(value);
+  return date ? date.toISOString() : null;
 }
 
 function serializeRobotState(robot) {
+  const timestamp = serializeDate(robot.timestamp);
+
   return {
     robotId: robot.robotId,
     batteryPercentage: robot.batteryPercentage,
@@ -165,20 +180,41 @@ function serializeRobotState(robot) {
     isCharging: robot.isCharging,
     temperature: robot.temperature,
     memoryUsage: robot.memoryUsage,
-    timestamp: serializeDate(robot.timestamp),
-    ...(robot.lastSeen ? { lastSeen: serializeDate(robot.lastSeen) } : {}),
+    timestamp,
+  };
+}
+
+function getLatestLastSeen(robot) {
+  const lastSeen = parseDateValue(robot.lastSeen);
+  const updatedAt = parseDateValue(robot.updatedAt);
+
+  if (lastSeen && lastSeen.getTime() <= Date.now() + FUTURE_LAST_SEEN_TOLERANCE_MS) {
+    return lastSeen;
+  }
+
+  return updatedAt || lastSeen || parseDateValue(robot.timestamp);
+}
+
+function serializeLatestRobotState(robot) {
+  const lastSeen = getLatestLastSeen(robot);
+
+  return {
+    ...serializeRobotState(robot),
+    ...(lastSeen ? { lastSeen: serializeDate(lastSeen) } : {}),
   };
 }
 
 async function persistTelemetry(telemetry) {
+  const receivedAt = new Date();
+
   await RobotTelemetry.create(telemetry);
 
-  await RobotLatestState.findOneAndUpdate(
+  return RobotLatestState.findOneAndUpdate(
     { robotId: telemetry.robotId },
     {
       $set: {
         ...telemetry,
-        lastSeen: telemetry.timestamp,
+        lastSeen: receivedAt,
       },
     },
     {
@@ -186,7 +222,7 @@ async function persistTelemetry(telemetry) {
       new: true,
       setDefaultsOnInsert: true,
     }
-  );
+  ).lean();
 }
 
 function broadcastDashboardMessage(payload) {
@@ -251,7 +287,7 @@ app.get('/api/robots', (res) => {
 
     if (!isAborted()) {
       sendJson(res, 200, {
-        robots: robots.map(serializeRobotState),
+        robots: robots.map(serializeLatestRobotState),
       });
     }
   });
@@ -324,9 +360,12 @@ app.ws('/robots', {
     }
 
     try {
-      await persistTelemetry(validation.telemetry);
+      const latestState = await persistTelemetry(validation.telemetry);
 
-      const data = serializeRobotState(validation.telemetry);
+      const data = serializeLatestRobotState(latestState || {
+        ...validation.telemetry,
+        lastSeen: new Date(),
+      });
       broadcastDashboardMessage(JSON.stringify({
         type: 'robot_update',
         robotId: data.robotId,
