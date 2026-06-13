@@ -189,6 +189,22 @@ async function persistTelemetry(telemetry) {
   );
 }
 
+function broadcastDashboardMessage(payload) {
+  if (process.env.CLUSTER_WORKER === 'true' && typeof process.send === 'function') {
+    try {
+      process.send({
+        type: 'dashboard:broadcast',
+        payload,
+      });
+      return;
+    } catch (error) {
+      console.error('Failed to send dashboard update to primary process:', error.message);
+    }
+  }
+
+  app.publish(DASHBOARD_TOPIC, payload);
+}
+
 function handleAsyncRoute(res, handler) {
   let aborted = false;
 
@@ -311,7 +327,7 @@ app.ws('/robots', {
       await persistTelemetry(validation.telemetry);
 
       const data = serializeRobotState(validation.telemetry);
-      app.publish(DASHBOARD_TOPIC, JSON.stringify({
+      broadcastDashboardMessage(JSON.stringify({
         type: 'robot_update',
         robotId: data.robotId,
         data,
@@ -381,6 +397,14 @@ app.ws('/dashboard', {
 
 app.any('/*', (res) => {
   sendError(res, 404, 'Not found');
+});
+
+process.on('message', (message) => {
+  if (!message || message.type !== 'dashboard:broadcast' || typeof message.payload !== 'string') {
+    return;
+  }
+
+  app.publish(DASHBOARD_TOPIC, message.payload);
 });
 
 connectDB()
