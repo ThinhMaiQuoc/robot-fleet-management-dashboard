@@ -34,6 +34,7 @@ export interface ChartDataPoint {
   timestamp: string
   batteryPercentage: number
   wifiSignalStrength: number
+  isCharging: boolean
   temperature: number
   memoryUsage: number
 }
