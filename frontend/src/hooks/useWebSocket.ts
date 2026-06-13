@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect, useRef } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 
 interface UseWebSocketReturn {
   isConnected: boolean
@@ -9,87 +9,132 @@ interface UseWebSocketReturn {
   reconnect: () => void
 }
 
+const RECONNECT_DELAY_MS = 3000
+
 export function useWebSocket(url: string): UseWebSocketReturn {
   const [isConnected, setIsConnected] = useState(false)
   const [lastMessage, setLastMessage] = useState<string | null>(null)
   const ws = useRef<WebSocket | null>(null)
-  const reconnectTimeoutRef = useRef<NodeJS.Timeout>()
+  const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const shouldReconnectRef = useRef(true)
+  const connectRef = useRef<() => void>(() => {})
 
-  const connect = () => {
+  const clearReconnectTimer = useCallback(() => {
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current)
+      reconnectTimeoutRef.current = null
+    }
+  }, [])
+
+  const scheduleReconnect = useCallback(() => {
+    if (!shouldReconnectRef.current || reconnectTimeoutRef.current) {
+      return
+    }
+
+    reconnectTimeoutRef.current = setTimeout(() => {
+      reconnectTimeoutRef.current = null
+      connectRef.current()
+    }, RECONNECT_DELAY_MS)
+  }, [])
+
+  const connect = useCallback(() => {
+    if (!url) {
+      return
+    }
+
+    const existingSocket = ws.current
+    if (
+      existingSocket
+      && (existingSocket.readyState === WebSocket.OPEN
+        || existingSocket.readyState === WebSocket.CONNECTING)
+    ) {
+      return
+    }
+
     try {
-      // TODO: Implement WebSocket connection logic
-      ws.current = new WebSocket(url)
+      const socket = new WebSocket(url)
+      ws.current = socket
 
-      ws.current.onopen = () => {
-        console.log('✅ WebSocket connected to:', url)
+      socket.onopen = () => {
+        if (ws.current !== socket) {
+          return
+        }
+
+        clearReconnectTimer()
         setIsConnected(true)
+      }
 
-        // Clear any existing reconnect timeout
-        if (reconnectTimeoutRef.current) {
-          clearTimeout(reconnectTimeoutRef.current)
+      socket.onmessage = (event) => {
+        if (ws.current === socket && typeof event.data === 'string') {
+          setLastMessage(event.data)
         }
       }
 
-      ws.current.onmessage = (event) => {
-        // TODO: Handle incoming messages
-        setLastMessage(event.data)
+      socket.onclose = () => {
+        if (ws.current === socket) {
+          ws.current = null
+          setIsConnected(false)
+          scheduleReconnect()
+        }
       }
 
-      ws.current.onclose = (event) => {
-        console.log('❌ WebSocket disconnected:', event.code, event.reason)
-        setIsConnected(false)
-
-        // TODO: Implement auto-reconnection logic
-        reconnectTimeoutRef.current = setTimeout(() => {
-          console.log('🔄 Attempting to reconnect...')
-          connect()
-        }, 3000)
+      socket.onerror = () => {
+        if (ws.current === socket) {
+          setIsConnected(false)
+        }
       }
-
-      ws.current.onerror = (error) => {
-        console.error('🚨 WebSocket error:', error)
-        setIsConnected(false)
-      }
-
     } catch (error) {
       console.error('Failed to connect WebSocket:', error)
       setIsConnected(false)
+      scheduleReconnect()
     }
-  }
+  }, [clearReconnectTimer, scheduleReconnect, url])
 
-  const sendMessage = (message: string) => {
+  useEffect(() => {
+    connectRef.current = connect
+  }, [connect])
+
+  const sendMessage = useCallback((message: string) => {
     if (ws.current && ws.current.readyState === WebSocket.OPEN) {
       ws.current.send(message)
     } else {
       console.warn('WebSocket is not connected')
     }
-  }
+  }, [])
 
-  const reconnect = () => {
+  const reconnect = useCallback(() => {
+    clearReconnectTimer()
+
     if (ws.current) {
-      ws.current.close()
+      const socket = ws.current
+      ws.current = null
+      socket.close()
     }
-    connect()
-  }
+
+    setIsConnected(false)
+    connectRef.current()
+  }, [clearReconnectTimer])
 
   useEffect(() => {
+    shouldReconnectRef.current = true
     connect()
 
-    // Cleanup on unmount
     return () => {
-      if (reconnectTimeoutRef.current) {
-        clearTimeout(reconnectTimeoutRef.current)
-      }
+      shouldReconnectRef.current = false
+      clearReconnectTimer()
+
       if (ws.current) {
-        ws.current.close()
+        const socket = ws.current
+        ws.current = null
+        socket.close()
       }
     }
-  }, [url])
+  }, [clearReconnectTimer, connect])
 
   return {
     isConnected,
     lastMessage,
     sendMessage,
-    reconnect
+    reconnect,
   }
 }

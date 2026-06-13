@@ -27,7 +27,7 @@ export interface WebSocketMessage {
   type: 'robot_update' | 'robot_connected' | 'robot_disconnected' | 'initial_robots'
   robotId?: string
   data?: Robot
-  robots?: string[]
+  robots?: Robot[]
 }
 
 export interface ChartDataPoint {
