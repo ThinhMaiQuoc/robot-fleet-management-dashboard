@@ -12,6 +12,7 @@ const {
 const PORT = Number(process.env.PORT) || 8080;
 const DASHBOARD_TOPIC = 'dashboard:robot-updates';
 const FUTURE_LAST_SEEN_TOLERANCE_MS = 5_000;
+const FUTURE_TELEMETRY_TOLERANCE_MS = 5_000;
 
 const HTTP_STATUS = {
   200: '200 OK',
@@ -135,8 +136,8 @@ function validateTelemetry(data, fallbackRobotId = '') {
   const timestamp = new Date(data.timestamp);
   if (!data.timestamp || Number.isNaN(timestamp.getTime())) {
     errors.push('timestamp must be a valid date');
-  } else if (timestamp.getTime() > Date.now()) {
-    errors.push('timestamp must not be in the future');
+  } else if (timestamp.getTime() > Date.now() + FUTURE_TELEMETRY_TOLERANCE_MS) {
+    errors.push('timestamp must not be more than 5 seconds in the future');
   }
 
   if (errors.length > 0) {
