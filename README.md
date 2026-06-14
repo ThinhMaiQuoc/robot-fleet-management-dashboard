@@ -28,6 +28,12 @@ Main folders:
 - `frontend/`: Next.js App Router dashboard and robot detail pages.
 - `compose.yml`: MongoDB, clustered backend, and frontend services.
 
+## Code Organization
+
+- Backend runtime wiring stays in `backend/app.js`; telemetry validation, serialization, and database operations live under `backend/telemetry/` so they can be tested without starting uWebSockets.
+- Frontend pages own rendering, navigation, data fetching, and notifications; reusable robot status, alert, and history transforms live under `frontend/src/utils/`.
+- Backend unit tests use Node's built-in test runner. Frontend verification uses ESLint and the Next production build.
+
 ## Requirements
 
 - Node.js 20 recommended for local development.
@@ -385,6 +391,9 @@ Redis is not implemented. This means cross-worker broadcasts work inside one clu
 Backend:
 
 ```bash
+cd backend
+npm run test
+cd ..
 node --check backend/app.js
 node --check backend/database/index.js
 node --check backend/cluster.js

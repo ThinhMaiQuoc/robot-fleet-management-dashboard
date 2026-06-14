@@ -8,11 +8,22 @@ const {
     RobotLatestState,
   },
 } = require('./database/index.js');
+const {
+  parseRobotMessage,
+  validateTelemetry,
+} = require('./telemetry/validation.js');
+const {
+  serializeLatestRobotState,
+  serializeRobotState,
+} = require('./telemetry/serialization.js');
+const { createTelemetryService } = require('./telemetry/service.js');
 
 const PORT = Number(process.env.PORT) || 8080;
 const DASHBOARD_TOPIC = 'dashboard:robot-updates';
-const FUTURE_LAST_SEEN_TOLERANCE_MS = 5_000;
-const FUTURE_TELEMETRY_TOLERANCE_MS = 5_000;
+const telemetryService = createTelemetryService({
+  RobotTelemetry,
+  RobotLatestState,
+});
 
 const HTTP_STATUS = {
   200: '200 OK',
@@ -57,173 +68,6 @@ function sendWebSocketMessage(ws, payload) {
 function getSocketRobotId(ws) {
   const userData = typeof ws.getUserData === 'function' ? ws.getUserData() : ws;
   return typeof userData.robotId === 'string' ? userData.robotId : '';
-}
-
-function parseRobotMessage(message) {
-  const rawMessage = Buffer.from(message).toString('utf8');
-
-  if (!rawMessage.trim()) {
-    return { error: 'Message body is empty' };
-  }
-
-  try {
-    const parsed = JSON.parse(rawMessage);
-
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      return { error: 'Message must be a JSON object' };
-    }
-
-    return { data: parsed };
-  } catch (error) {
-    return { error: 'Message must be valid JSON' };
-  }
-}
-
-function validateNumber(data, field, errors, options = {}) {
-  const value = data[field];
-
-  if (typeof value !== 'number' || !Number.isFinite(value)) {
-    errors.push(`${field} must be a finite number`);
-    return undefined;
-  }
-
-  if (options.min !== undefined && value < options.min) {
-    errors.push(`${field} must be greater than or equal to ${options.min}`);
-  }
-
-  if (options.max !== undefined && value > options.max) {
-    errors.push(`${field} must be less than or equal to ${options.max}`);
-  }
-
-  return value;
-}
-
-function validateTelemetry(data, fallbackRobotId = '') {
-  const errors = [];
-  const hasPayloadRobotId = Object.prototype.hasOwnProperty.call(data, 'robotId');
-  let robotId = '';
-
-  if (hasPayloadRobotId) {
-    if (typeof data.robotId !== 'string' || data.robotId.trim() === '') {
-      errors.push('robotId must be a non-empty string');
-    } else {
-      robotId = data.robotId.trim();
-    }
-  } else if (typeof fallbackRobotId === 'string' && fallbackRobotId.trim() !== '') {
-    robotId = fallbackRobotId.trim();
-  } else {
-    errors.push('robotId must be a non-empty string');
-  }
-
-  const batteryPercentage = validateNumber(data, 'batteryPercentage', errors, {
-    min: 0,
-    max: 100,
-  });
-  const wifiSignalStrength = validateNumber(data, 'wifiSignalStrength', errors, {
-    min: -100,
-    max: 0,
-  });
-  const temperature = validateNumber(data, 'temperature', errors);
-  const memoryUsage = validateNumber(data, 'memoryUsage', errors, {
-    min: 0,
-    max: 100,
-  });
-
-  if (typeof data.isCharging !== 'boolean') {
-    errors.push('isCharging must be a boolean');
-  }
-
-  const timestamp = new Date(data.timestamp);
-  if (!data.timestamp || Number.isNaN(timestamp.getTime())) {
-    errors.push('timestamp must be a valid date');
-  } else if (timestamp.getTime() > Date.now() + FUTURE_TELEMETRY_TOLERANCE_MS) {
-    errors.push('timestamp must not be more than 5 seconds in the future');
-  }
-
-  if (errors.length > 0) {
-    return { errors };
-  }
-
-  return {
-    telemetry: {
-      robotId,
-      batteryPercentage,
-      wifiSignalStrength,
-      isCharging: data.isCharging,
-      temperature,
-      memoryUsage,
-      timestamp,
-    },
-  };
-}
-
-function parseDateValue(value) {
-  if (!value) {
-    return null;
-  }
-
-  const date = value instanceof Date ? value : new Date(value);
-  return Number.isNaN(date.getTime()) ? null : date;
-}
-
-function serializeDate(value) {
-  const date = parseDateValue(value);
-  return date ? date.toISOString() : null;
-}
-
-function serializeRobotState(robot) {
-  const timestamp = serializeDate(robot.timestamp);
-
-  return {
-    robotId: robot.robotId,
-    batteryPercentage: robot.batteryPercentage,
-    wifiSignalStrength: robot.wifiSignalStrength,
-    isCharging: robot.isCharging,
-    temperature: robot.temperature,
-    memoryUsage: robot.memoryUsage,
-    timestamp,
-  };
-}
-
-function getLatestLastSeen(robot) {
-  const lastSeen = parseDateValue(robot.lastSeen);
-  const updatedAt = parseDateValue(robot.updatedAt);
-
-  if (lastSeen && lastSeen.getTime() <= Date.now() + FUTURE_LAST_SEEN_TOLERANCE_MS) {
-    return lastSeen;
-  }
-
-  return updatedAt || lastSeen || parseDateValue(robot.timestamp);
-}
-
-function serializeLatestRobotState(robot) {
-  const lastSeen = getLatestLastSeen(robot);
-
-  return {
-    ...serializeRobotState(robot),
-    ...(lastSeen ? { lastSeen: serializeDate(lastSeen) } : {}),
-  };
-}
-
-async function persistTelemetry(telemetry) {
-  const receivedAt = new Date();
-
-  await RobotTelemetry.create(telemetry);
-
-  return RobotLatestState.findOneAndUpdate(
-    { robotId: telemetry.robotId },
-    {
-      $set: {
-        ...telemetry,
-        lastSeen: receivedAt,
-      },
-    },
-    {
-      upsert: true,
-      new: true,
-      setDefaultsOnInsert: true,
-    }
-  ).lean();
 }
 
 function broadcastDashboardMessage(payload) {
@@ -282,9 +126,7 @@ app.get('/health', (res) => {
 
 app.get('/api/robots', (res) => {
   handleAsyncRoute(res, async (isAborted) => {
-    const robots = await RobotLatestState.find({})
-      .sort({ robotId: 1 })
-      .lean();
+    const robots = await telemetryService.listLatestRobots();
 
     if (!isAborted()) {
       sendJson(res, 200, {
@@ -314,17 +156,12 @@ app.get('/api/robots/:robotId/history', (res, req) => {
       return;
     }
 
-    const since = new Date(Date.now() - hours * 60 * 60 * 1000);
-    const history = await RobotTelemetry.find({
-      robotId: robotId.trim(),
-      timestamp: { $gte: since },
-    })
-      .sort({ timestamp: 1 })
-      .lean();
+    const trimmedRobotId = robotId.trim();
+    const history = await telemetryService.getRobotHistory(trimmedRobotId, hours);
 
     if (!isAborted()) {
       sendJson(res, 200, {
-        robotId: robotId.trim(),
+        robotId: trimmedRobotId,
         hours,
         data: history.map(serializeRobotState),
       });
@@ -361,7 +198,7 @@ app.ws('/robots', {
     }
 
     try {
-      const latestState = await persistTelemetry(validation.telemetry);
+      const latestState = await telemetryService.persistTelemetry(validation.telemetry);
 
       const data = serializeLatestRobotState(latestState || {
         ...validation.telemetry,

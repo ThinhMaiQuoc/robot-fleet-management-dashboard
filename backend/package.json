@@ -7,7 +7,8 @@
     "start": "node app.js",
     "dev": "nodemon app.js",
     "simulator": "node simulator/robot-simulator.js",
-    "cluster": "node cluster.js"
+    "cluster": "node cluster.js",
+    "test": "node --test"
   },
   "dependencies": {
     "uWebSockets.js": "uNetworking/uWebSockets.js#v20.33.0",

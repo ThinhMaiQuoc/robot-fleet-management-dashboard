@@ -30,25 +30,25 @@ import {
   YAxis,
 } from 'recharts'
 import { useWebSocket } from '../../../hooks/useWebSocket'
-import type { ChartDataPoint, Robot, WebSocketMessage } from '../../../types/robot'
+import type { Robot, WebSocketMessage } from '../../../types/robot'
+import {
+  HISTORY_HOURS,
+  decodeRouteParam,
+  mergeChartPoints,
+  toChartPoint,
+  type DetailChartPoint,
+} from '../../../utils/robotHistory'
 
 const { Header, Content } = Layout
 const { Text, Title } = Typography
 
 const API_BASE_URL = (process.env.API_BASE_URL || '/api').replace(/\/$/, '')
 const WEBSOCKET_URL = (process.env.WEBSOCKET_URL || 'ws://localhost:8080').replace(/\/$/, '')
-const HISTORY_HOURS = 6
-const HISTORY_WINDOW_MS = HISTORY_HOURS * 60 * 60 * 1000
 
 interface HistoryResponse {
   robotId: string
   hours: number
   data: Robot[]
-}
-
-interface DetailChartPoint extends ChartDataPoint {
-  time: number
-  chargingValue: number
 }
 
 interface MetricChartProps {
@@ -58,57 +58,6 @@ interface MetricChartProps {
   title: string
   unit: string
   yDomain?: [number | string, number | string]
-}
-
-function decodeRouteParam(value: string | string[] | undefined): string {
-  const routeValue = Array.isArray(value) ? value[0] : value
-
-  if (!routeValue) {
-    return ''
-  }
-
-  try {
-    return decodeURIComponent(routeValue)
-  } catch {
-    return routeValue
-  }
-}
-
-function toChartPoint(robot: Robot): DetailChartPoint | null {
-  const time = new Date(robot.timestamp).getTime()
-
-  if (!Number.isFinite(time)) {
-    return null
-  }
-
-  return {
-    timestamp: robot.timestamp,
-    batteryPercentage: robot.batteryPercentage,
-    wifiSignalStrength: robot.wifiSignalStrength,
-    isCharging: robot.isCharging,
-    temperature: robot.temperature,
-    memoryUsage: robot.memoryUsage,
-    time,
-    chargingValue: robot.isCharging ? 1 : 0,
-  }
-}
-
-function mergeChartPoints(
-  currentPoints: DetailChartPoint[],
-  incomingPoints: DetailChartPoint[],
-  referenceTime = Date.now()
-): DetailChartPoint[] {
-  const cutoffTime = referenceTime - HISTORY_WINDOW_MS
-  const pointsByTimestamp = new Map<string, DetailChartPoint>()
-
-  currentPoints.concat(incomingPoints).forEach((point) => {
-    if (point.time >= cutoffTime) {
-      pointsByTimestamp.set(point.timestamp, point)
-    }
-  })
-
-  return Array.from(pointsByTimestamp.values())
-    .sort((left, right) => left.time - right.time)
 }
 
 function formatAxisTime(value: number | string): string {

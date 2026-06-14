@@ -25,17 +25,26 @@ import {
 } from '@ant-design/icons'
 import { useWebSocket } from '../hooks/useWebSocket'
 import type { Robot, WebSocketMessage } from '../types/robot'
+import {
+  createInitialBatteryAlertState,
+  getNextBatteryAlertState,
+  type BatteryAlertState,
+} from '../utils/batteryAlerts'
+import {
+  OFFLINE_THRESHOLD_MS,
+  formatRelativeTime,
+  getLastSeenTime,
+  getRobotStatus,
+  isLowBattery,
+  type RobotStatus,
+} from '../utils/robotStatus'
 
 const { Header, Content } = Layout
 const { Text, Title } = Typography
 
 const API_BASE_URL = (process.env.API_BASE_URL || '/api').replace(/\/$/, '')
 const WEBSOCKET_URL = (process.env.WEBSOCKET_URL || 'ws://localhost:8080').replace(/\/$/, '')
-const OFFLINE_THRESHOLD_MS = 15_000
-const CRITICAL_BATTERY_MS = 5 * 60 * 1000
 const CLOCK_TICK_MS = 1000
-
-type RobotStatus = 'online' | 'offline' | 'warning'
 
 interface DashboardRobot extends Robot {
   key: string
@@ -47,62 +56,8 @@ interface RobotsResponse {
   robots: Robot[]
 }
 
-interface BatteryAlertState {
-  lowSince: number | null
-  lowNotified: boolean
-  criticalNotified: boolean
-}
-
-function getLastSeenTime(robot: Robot): number {
-  const lastSeen = robot.lastSeen || robot.timestamp
-  const lastSeenTime = new Date(lastSeen).getTime()
-  return Number.isFinite(lastSeenTime) ? lastSeenTime : 0
-}
-
-function isLowBattery(robot: Robot): boolean {
-  return robot.batteryPercentage < 20 && !robot.isCharging
-}
-
-function getRobotStatus(robot: Robot, now: number): RobotStatus {
-  const isOffline = now - getLastSeenTime(robot) > OFFLINE_THRESHOLD_MS
-
-  if (isOffline) {
-    return 'offline'
-  }
-
-  if (isLowBattery(robot)) {
-    return 'warning'
-  }
-
-  return 'online'
-}
-
 function formatPercent(value: number): number {
   return Math.max(0, Math.min(100, Math.round(value)))
-}
-
-function formatRelativeTime(timestamp: number, now: number): string {
-  if (!timestamp) {
-    return 'Unknown'
-  }
-
-  const elapsedSeconds = Math.max(0, Math.round((now - timestamp) / 1000))
-
-  if (elapsedSeconds < 5) {
-    return 'Just now'
-  }
-
-  if (elapsedSeconds < 60) {
-    return `${elapsedSeconds}s ago`
-  }
-
-  const elapsedMinutes = Math.round(elapsedSeconds / 60)
-  if (elapsedMinutes < 60) {
-    return `${elapsedMinutes}m ago`
-  }
-
-  const elapsedHours = Math.round(elapsedMinutes / 60)
-  return `${elapsedHours}h ago`
 }
 
 function getWifiColor(signal: number): string {
@@ -217,24 +172,10 @@ export default function Dashboard() {
 
   useEffect(() => {
     robots.forEach((robot) => {
-      const existingState = alertStateRef.current[robot.robotId] || {
-        lowSince: null,
-        lowNotified: false,
-        criticalNotified: false,
-      }
+      const existingState = alertStateRef.current[robot.robotId] || createInitialBatteryAlertState()
+      const transition = getNextBatteryAlertState(robot, existingState, now)
 
-      if (!isLowBattery(robot)) {
-        alertStateRef.current[robot.robotId] = {
-          lowSince: null,
-          lowNotified: false,
-          criticalNotified: false,
-        }
-        return
-      }
-
-      const lowSince = existingState.lowSince || now
-
-      if (!existingState.lowNotified) {
+      if (transition.lowBatteryStarted) {
         notificationApi.warning({
           key: `low-battery-${robot.robotId}`,
           message: `Robot ${robot.robotId} is low battery!`,
@@ -243,7 +184,7 @@ export default function Dashboard() {
         })
       }
 
-      if (!existingState.criticalNotified && now - lowSince >= CRITICAL_BATTERY_MS) {
+      if (transition.criticalBatteryStarted) {
         notificationApi.error({
           key: `critical-battery-${robot.robotId}`,
           message: `Robot ${robot.robotId} will be shut down soon!`,
@@ -252,11 +193,7 @@ export default function Dashboard() {
         })
       }
 
-      alertStateRef.current[robot.robotId] = {
-        lowSince,
-        lowNotified: true,
-        criticalNotified: existingState.criticalNotified || now - lowSince >= CRITICAL_BATTERY_MS,
-      }
+      alertStateRef.current[robot.robotId] = transition.state
     })
   }, [notificationApi, now, robots])
 
